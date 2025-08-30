@@ -1,0 +1,24 @@
+# Data path.
+common:
+    image_file: "/home/msi/MFCalib_opensource/test.png"
+    pcd_file: "/home/msi/MFCalib_opensource/test.pcd"
+    result_file: "/home/msi/MFCalib_ws/src/MFCalib/result/extrinsic.txt"
+    debug_dir: "/home/msi/MFCalib_ws/src/MFCalib/result/debug_dir/"
+
+
+# Camera Parameters.
+camera:
+
+    camera_matrix:   [654.480722392, 0.0, 309.572671087,
+      0.0,  654.119882261, 245.22870244,
+      0.0, 0.0, 1.0 ]      
+    dist_coeffs: [-0.07888101265529976, 0.1531478345742965, 0.001795999455517393, -0.0006121965127613818, 0]    #device pinhole
+
+
+
+
+
+# Calibration Parameters.
+calib:
+    calib_config_file: "/home/msi/MFCalib_ws/src/MFCalib/config/config.yaml"
+
