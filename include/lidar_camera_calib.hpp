@@ -4,6 +4,8 @@
 #include "CustomMsg.h"
 #include "common.h"
 #include <Eigen/Core>
+#include <cmath>
+#include <limits>
 #include <cv_bridge/cv_bridge.h>
 #include <fstream>
 #include <iostream>
@@ -166,6 +168,13 @@ public:
   pcl::PointCloud<pcl::PointXYZ>::Ptr rgb_egde_cloud_;
   // 存储LiDAR Depth/Intensity图像边缘点的2D点云
   pcl::PointCloud<pcl::PointXYZ>::Ptr lidar_edge_cloud_;
+  struct DepthEdgeInfo {
+    Eigen::Vector2f tangent;
+    float front_depth;
+    float back_depth;
+  };
+  pcl::PointCloud<pcl::PointXYZI>::Ptr lidar_depth_edge_cloud_;
+  std::vector<DepthEdgeInfo> lidar_depth_edge_info_;
 };
 
 Calibration::Calibration(const std::string &image_file,
@@ -203,6 +212,10 @@ Calibration::Calibration(const std::string &image_file,
   std::string msg = "Sucessfully extract edge from image, edge size:" +
                     std::to_string(rgb_egde_cloud_->size());
   ROS_INFO_STREAM(msg.c_str());
+
+  lidar_depth_edge_cloud_ =
+      pcl::PointCloud<pcl::PointXYZI>::Ptr(new pcl::PointCloud<pcl::PointXYZI>);
+  lidar_depth_edge_info_.clear();
 
   raw_lidar_cloud_ =
       pcl::PointCloud<pcl::PointXYZI>::Ptr(new pcl::PointCloud<pcl::PointXYZI>);
@@ -422,53 +435,71 @@ void Calibration::lidarToSphere(const std::string &pcd_file,
 //             tags_map[u][v].push_back(i); // 将点的索引添加到 tag 中
 //         }
 // }
-// 首先找到点云中的最大和最小深度值
-float min_z = std::numeric_limits<float>::max();
-float max_z = -std::numeric_limits<float>::max();
-for (const auto &point : polar_cloud->points) {
-    if (point.z < min_z) {
-        min_z = point.z;
+    lidar_depth_edge_info_.clear();
+    lidar_depth_edge_info_.reserve(polar_cloud->points.size());
+    if (lidar_depth_edge_cloud_) {
+      lidar_depth_edge_cloud_->clear();
     }
-    if (point.z > max_z) {
-        max_z = point.z;
-    }
-}
 
+    // 初始化图像缓存
+    cv::Mat intensity_img = cv::Mat::zeros(image_rows, image_cols, CV_32F);
+    cv::Mat count_img = cv::Mat::zeros(image_rows, image_cols, CV_32F);
+    cv::Mat min_depth_img(
+        image_rows, image_cols, CV_32F,
+        cv::Scalar(std::numeric_limits<float>::infinity()));
+    cv::Mat max_depth_img(
+        image_rows, image_cols, CV_32F,
+        cv::Scalar(-std::numeric_limits<float>::infinity()));
+    cv::Mat depth_valid_mask(image_rows, image_cols, CV_8U, cv::Scalar(0));
 
+    // 遍历点云
+    for (size_t i = 0; i < polar_cloud->points.size(); ++i) {
+      const auto &point = polar_cloud->points[i];
+      int u = static_cast<int>((theta_max - point.x) / kRadPerPix);
+      int v = static_cast<int>((point.y + M_PI) / kRadPerPix);
 
-
-// 初始化强度图像
-cv::Mat intensity_img = cv::Mat::zeros(image_rows, image_cols, CV_32F);
-cv::Mat count_img = cv::Mat::zeros(image_rows, image_cols, CV_32F);
-// 遍历点云
-for (size_t i = 0; i < polar_cloud->points.size(); ++i) {
-    const auto &point = polar_cloud->points[i];
-    int u = static_cast<int>((theta_max - point.x) / kRadPerPix);
-    int v = static_cast<int>((point.y + M_PI) / kRadPerPix );
-
-    if (u >= 0 && u < image_rows && v >= 0 && v < image_cols) {
-        // 累加强度值和计数
+      if (u >= 0 && u < image_rows && v >= 0 && v < image_cols) {
         intensity_img.at<float>(u, v) += point.intensity;
         count_img.at<float>(u, v) += 1.0f;
 
-         tags_map[u][v].push_back(i); // 添加当前索引  像素点保留所有对应深度值的雷达点
-    }
-}
-
-// 计算平均强度值
-for (int u = 0; u < intensity_img.rows; ++u) {
-    for (int v = 0; v < intensity_img.cols; ++v) {
-        if (count_img.at<float>(u, v) > 0) {
-            intensity_img.at<float>(u, v) /= count_img.at<float>(u, v);
+        float radius = point.z;
+        float &min_depth = min_depth_img.at<float>(u, v);
+        float &max_depth = max_depth_img.at<float>(u, v);
+        if (radius < min_depth) {
+          min_depth = radius;
         }
+        if (radius > max_depth) {
+          max_depth = radius;
+        }
+        depth_valid_mask.at<uchar>(u, v) = 255;
+        tags_map[u][v].push_back(i);
+      }
     }
-}
 
+    for (int u = 0; u < intensity_img.rows; ++u) {
+      for (int v = 0; v < intensity_img.cols; ++v) {
+        if (count_img.at<float>(u, v) > 0) {
+          intensity_img.at<float>(u, v) /= count_img.at<float>(u, v);
+        }
+      }
+    }
 
+    float nan_value = std::numeric_limits<float>::quiet_NaN();
+    min_depth_img.setTo(nan_value, depth_valid_mask == 0);
+    max_depth_img.setTo(nan_value, depth_valid_mask == 0);
+
+    cv::Mat depth_for_gradient = min_depth_img.clone();
+    depth_for_gradient.setTo(0, depth_valid_mask == 0);
+    cv::Mat grad_x;
+    cv::Mat grad_y;
+    cv::Mat grad_mag;
+    cv::Sobel(depth_for_gradient, grad_x, CV_32F, 1, 0, 3);
+    cv::Sobel(depth_for_gradient, grad_y, CV_32F, 0, 1, 3);
+    cv::magnitude(grad_x, grad_y, grad_mag);
 
     /** add the tags_map of this specific pose to maps **/
-   tagsMap = tags_map;
-    cv::imwrite(debug_dir+"intensity_img.png", intensity_img);
+    tagsMap = tags_map;
+    cv::imwrite(debug_dir + "intensity_img.png", intensity_img);
 
 
     // 调用Python边缘检测脚本
@@ -491,80 +522,173 @@ if(status != 0) {
     pcl::PointCloud<pcl::PointXYZI>::Ptr edge_xyzi(new pcl::PointCloud<pcl::PointXYZI>);
 
 
-// 遍历图像的每个像素   舍弃深度连续边，确认深度非连续边没有上到后景
+// 遍历图像中的每个像素，筛选具有稳定深度跳变与方向的边缘
 cout << "----- 遍历图像中的每个像素 -----" << endl;
-for (int u = 0; u < edge_img.rows; ++u) {
-    for (int v = 0; v < edge_img.cols; ++v) {
-        // 如果像素值大于127，认为是边缘点
-        if (edge_img.at<uchar>(u, v) > 127) {
-            // 定义最小平均深度和对应的像素点坐标
-            float min_avg_depth = std::numeric_limits<float>::max();
-            int min_u = u, min_v = v;
-            // 遍历邻域内的像素点
-            for (int du = -1; du <= 1; ++du) {
-                for (int dv = -1; dv <= 1; ++dv) {
-                    int nu = u + du, nv = v + dv;
-                    // 检查像素点是否在图像内
-                    if (nu >= 0 && nu < edge_img.rows && nv >= 0 && nv < edge_img.cols) {
-                        // 计算平均深度
-                        float sum_depth = 0;
-                        for (const auto &index : tags_map[nu][nv]) {
-                            sum_depth += polar_cloud->points[index].z;
-                        }
-                        float avg_depth = sum_depth / tags_map[nu][nv].size();
+const float kGradientMagnitudeThreshold = 0.02f;
+const float kDepthJumpThreshold = 0.3f;
+const float kAssociationTolerance = 0.15f;
+const float kSampleStep = 1.0f;
 
-                            // 更新最小平均深度和对应的像素点坐标
-                            if (std::abs(avg_depth - min_avg_depth) > 0.2 && avg_depth + 0.1 < min_avg_depth) {
-                                min_avg_depth = avg_depth;
-                                min_u = nu;
-                                min_v = nv;
-                            }
-                        }
-                    }
-                }
-            
-            // 判断是否是真正的边缘点
-            bool is_real_edge = false;
-            for (int du = -2; du <= 2; ++du) {
-                for (int dv = -2; dv <= 2; ++dv) {
-                    int nu = min_u + du, nv = min_v + dv;
-                    // 检查像素点是否在图像内
-                    if (nu >= 0 && nu < edge_img.rows && nv >= 0 && nv < edge_img.cols) {
-                        // 计算平均深度
-                        float sum_depth = 0;
-                        for (const auto &index : tags_map[nu][nv]) {
-                            sum_depth += polar_cloud->points[index].z;
-                        }
-                        float avg_depth = sum_depth / tags_map[nu][nv].size();
-                        // 如果周围的平均深度比当前的平均深度大于0.3m，或是平面图案边缘，则是真正的边缘点
-                       if (std::abs(avg_depth - min_avg_depth) > 0.1 || std::abs(avg_depth - min_avg_depth) < 0.03) {
-                          //if (std::abs(avg_depth - min_avg_depth) > 0.3) {   //仅保留深度非连续边缘
-                            is_real_edge = true;
-                            break;
-                        }
-                    }
-                }
-                if (!is_real_edge) {
-                    break;
-                }
-            }
-            // 如果是真正的边缘点，则将点添加到边缘点云中
-            if (is_real_edge) {
-                for (const auto &index : tags_map[min_u][min_v]) {
-                    edge_xyzi->points.push_back(raw_lidar_cloud_->points[index]);
-                }
-            }
-        }
+auto sampleDepth = [&](float row, float col) -> float {
+  int sample_u = static_cast<int>(std::round(row));
+  int sample_v = static_cast<int>(std::round(col));
+  if (sample_u < 0 || sample_u >= edge_img.rows || sample_v < 0 ||
+      sample_v >= edge_img.cols) {
+    return std::numeric_limits<float>::quiet_NaN();
+  }
+  if (!depth_valid_mask.at<uchar>(sample_u, sample_v)) {
+    return std::numeric_limits<float>::quiet_NaN();
+  }
+  return min_depth_img.at<float>(sample_u, sample_v);
+};
+
+for (int u = 0; u < edge_img.rows; ++u) {
+  for (int v = 0; v < edge_img.cols; ++v) {
+    if (edge_img.at<uchar>(u, v) <= 127) {
+      continue;
     }
+    if (!depth_valid_mask.at<uchar>(u, v)) {
+      continue;
+    }
+
+    float front_depth = min_depth_img.at<float>(u, v);
+    if (!std::isfinite(front_depth)) {
+      continue;
+    }
+
+    float gradient_mag = grad_mag.at<float>(u, v);
+    if (!std::isfinite(gradient_mag) || gradient_mag < kGradientMagnitudeThreshold) {
+      continue;
+    }
+
+    cv::Vec2f normal(grad_x.at<float>(u, v), grad_y.at<float>(u, v));
+    float normal_norm = cv::norm(normal);
+    if (normal_norm < 1e-6f) {
+      continue;
+    }
+    normal /= normal_norm;
+
+    float background_depth = std::numeric_limits<float>::quiet_NaN();
+    float local_max_depth = max_depth_img.at<float>(u, v);
+    if (std::isfinite(local_max_depth) &&
+        (local_max_depth - front_depth) > kDepthJumpThreshold) {
+      background_depth = local_max_depth;
+    } else {
+      float forward_depth = sampleDepth(u + normal[1] * kSampleStep,
+                                        v + normal[0] * kSampleStep);
+      float backward_depth = sampleDepth(u - normal[1] * kSampleStep,
+                                         v - normal[0] * kSampleStep);
+      if (std::isfinite(forward_depth) && forward_depth > front_depth) {
+        background_depth = forward_depth;
+      }
+      if (std::isfinite(backward_depth) && backward_depth > front_depth) {
+        if (!std::isfinite(background_depth) ||
+            backward_depth < background_depth) {
+          background_depth = backward_depth;
+        }
+      }
+    }
+
+    if (!std::isfinite(background_depth)) {
+      continue;
+    }
+    if ((background_depth - front_depth) < kDepthJumpThreshold) {
+      continue;
+    }
+
+    cv::Vec2f tangent(-normal[1], normal[0]);
+    float tangent_norm = cv::norm(tangent);
+    if (tangent_norm < 1e-6f) {
+      continue;
+    }
+    tangent /= tangent_norm;
+
+    const std::vector<int> *pixel_indices = &tags_map[u][v];
+    int assoc_u = u;
+    int assoc_v = v;
+    if (pixel_indices->empty()) {
+      float best_diff = std::numeric_limits<float>::infinity();
+      for (int du = -1; du <= 1; ++du) {
+        for (int dv = -1; dv <= 1; ++dv) {
+          int nu = u + du;
+          int nv = v + dv;
+          if (nu < 0 || nu >= edge_img.rows || nv < 0 || nv >= edge_img.cols) {
+            continue;
+          }
+          if (tags_map[nu][nv].empty()) {
+            continue;
+          }
+          float neighbor_depth = min_depth_img.at<float>(nu, nv);
+          if (!std::isfinite(neighbor_depth)) {
+            continue;
+          }
+          float diff = std::abs(neighbor_depth - front_depth);
+          if (diff < best_diff) {
+            best_diff = diff;
+            pixel_indices = &tags_map[nu][nv];
+            assoc_u = nu;
+            assoc_v = nv;
+          }
+        }
+      }
+    }
+    if (pixel_indices->empty()) {
+      continue;
+    }
+
+    float assoc_depth = min_depth_img.at<float>(assoc_u, assoc_v);
+    if (!std::isfinite(assoc_depth)) {
+      assoc_depth = front_depth;
+    }
+
+    bool pushed_point = false;
+    for (const auto &index : *pixel_indices) {
+      const auto &origin_point = raw_lidar_cloud_->points[index];
+      float radius = origin_point.getVector3fMap().norm();
+      if (std::fabs(radius - assoc_depth) > kAssociationTolerance) {
+        continue;
+      }
+      edge_xyzi->points.push_back(origin_point);
+      DepthEdgeInfo info{Eigen::Vector2f(tangent[0], tangent[1]), assoc_depth,
+                         background_depth};
+      lidar_depth_edge_info_.push_back(info);
+      pushed_point = true;
+    }
+
+    if (!pushed_point) {
+      float best_depth = std::numeric_limits<float>::infinity();
+      int best_index = -1;
+      for (const auto &index : *pixel_indices) {
+        float radius = raw_lidar_cloud_->points[index].getVector3fMap().norm();
+        if (radius < best_depth) {
+          best_depth = radius;
+          best_index = index;
+        }
+      }
+      if (best_index >= 0) {
+        edge_xyzi->points.push_back(raw_lidar_cloud_->points[best_index]);
+        DepthEdgeInfo info{Eigen::Vector2f(tangent[0], tangent[1]), best_depth,
+                           background_depth};
+        lidar_depth_edge_info_.push_back(info);
+      }
+    }
+  }
 }
 cout << "----- 遍历完成 -----" << endl;
 
-
 std::cout << "Size of edge_xyzi: " << edge_xyzi->points.size() << std::endl;
+std::cout << "Stored depth edge info: " << lidar_depth_edge_info_.size()
+          << std::endl;
 
     // 将处理后的点云复制到另一个点云对象中
     pcl::PointCloud<pcl::PointXYZI>::Ptr edge_discon(new pcl::PointCloud<pcl::PointXYZI>);
     pcl::copyPointCloud(*edge_xyzi, *edge_discon);
+    lidar_depth_edge_cloud_ = edge_discon;
+    if (lidar_depth_edge_info_.size() != edge_discon->points.size()) {
+      ROS_WARN_STREAM("Depth edge info size mismatch: "
+                      << lidar_depth_edge_info_.size() << " vs "
+                      << edge_discon->points.size());
+    }
     
     // 创建一个新的点云用于存储拼接后的点云  这一段用于将非连续边缘点云添加到平面点云中进行之后的优化
     pcl::PointCloud<pcl::PointXYZI>::Ptr concat_cloud(new pcl::PointCloud<pcl::PointXYZI>);
